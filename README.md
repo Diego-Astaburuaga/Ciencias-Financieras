@@ -3,5 +3,4 @@
 <h1 align='center'> Trabajos relacionados a Finanzas y ciencias relacionadas</h1>
 <hr style="height:2px;border:none"/>
 
-# Trabajos relacionados a Finanzas y ciencias relacionadas
 Repositorio dedicado a almacenar contenido relacionado a Finanzas / Ciencias Financieras / Quantitative Finance.
