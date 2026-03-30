@@ -1,0 +1,315 @@
+Metadata-Version: 2.4
+Name: hawkes-enhanced-rv-forecast
+Version: 0.1.0
+Summary: Extreme-event augmented realized volatility forecasting experiments
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: scikit-learn>=1.3
+Requires-Dist: scipy>=1.10
+Requires-Dist: pyarrow>=12.0
+Requires-Dist: torch>=2.0
+
+# Extreme Events and Realized Volatility Forecasting: Information Augmentation in Linear and Nonlinear Models
+
+## Objective
+
+This project studies whether intraday extreme-return information improves daily realized volatility (RV) forecasting for crypto assets.
+
+The key methodological constraint is a fair comparison between:
+1. HAR (linear, aggregated-information representation), and
+2. LSTM (nonlinear, raw sequential-information representation),
+
+using the same target, same rolling train/test windows, and same underlying daily information set.
+
+The workflow combines:
+
+1. Daily RV construction from 5-minute Binance data.
+2. Extreme-event detection from intraday returns using rolling quantile regression.
+3. Daily aggregation of event intensity features.
+4. Rolling-window forecast comparison between linear (HAR) and nonlinear (LSTM) models.
+5. Forecast comparison using statistical tests (Diebold-Mariano and Model Confidence Set).
+
+## Repository Structure
+
+```text
+.
+├── data/
+│   ├── raw/                 # Source 5-minute CSV files (coinUSDT)
+│   ├── interim/
+│   │   ├── daily_rv/        # Daily RV parquet files: {COIN}_rv.parquet
+│   │   ├── event_5_min/     # Intraday event parquet files: {COIN}_5m_events.parquet
+│   │   └── hawkes_daily/    # Hawkes diagnostics parquet files: {COIN}_hawkes_daily.parquet
+│   ├── processed/
+│   │   ├── HAR/             # HAR-ready datasets: {COIN}_har.parquet
+│   │   └── LSTM/            # LSTM-ready datasets: {COIN}_lstm.parquet
+│   └── temp/                # Temporary experiment outputs
+├── documents/               # Project notes and supplementary documents
+├── notebooks/               # EDA and experiment runners
+│   ├── run_rolling_window.ipynb
+│   ├── data_handling.ipynb
+│   └── data_quality.ipynb
+├── results/                 # Final experiment outputs and summaries
+├── src/
+│   ├── config/
+│   │   └── paths.py         # Centralized absolute path definitions
+│   ├── data/
+│   │   └── build_intraday_and_rv.py
+│   ├── features/
+│   │   ├── create_hawkes_feat.py
+│   │   ├── identify_events.py
+│   │   ├── tick_env_hawkes_fit.py
+│   │   └── create_raw_event_feat.py
+│   ├── models/
+│   │   ├── base.py
+│   │   ├── har.py
+│   │   ├── LSTM.py
+│   │   └── types.py
+│   └── evaluation/
+│       ├── eval_rolling_window.py
+│       ├── dm_test.py
+│       └── mcs_test.py
+└── README.md
+```
+
+## Data Pipeline
+
+### 1) Raw intraday data to daily RV
+
+Script: src/data/build_intraday_and_rv.py
+
+Input:
+1. data/raw/{COIN}USDT_binance_*.csv
+
+Output:
+1. data/interim/daily_rv/{COIN}_rv.parquet
+
+Logic:
+1. Load 5-minute OHLCV data.
+2. Compute intraday log-returns from open prices.
+3. Aggregate by day as realized volatility: sum of squared intraday returns.
+
+Notation:
+
+Let $p_{d,j}$ be the open price at day $d$ and intraday slot $j$, with $j=1,\dots,M$ and $M=288$ for 5-minute bars.
+
+Intraday return:
+
+$$
+r_{d,j} = \log p_{d,j} - \log p_{d,j-1}.
+$$
+
+Daily realized volatility:
+
+$$
+RV_d = \sum_{j=1}^{M} r_{d,j}^2.
+$$
+
+### 2) Intraday quantile regression to identify extreme events
+
+Script: src/features/identify_events.py
+
+Input:
+1. data/raw/{COIN}USDT*_2026.csv
+
+Output:
+1. data/interim/event_5_min/{COIN}_5m_events.parquet
+
+Logic:
+1. Build intraday regressors (lags and Fourier terms).
+2. Fit rolling quantile regression windows.
+3. Define event exceedance per interval as max(0, y_true - y_pred).
+4. Save checkpoints incrementally in parquet format.
+
+Downside jump-detection formulation:
+
+Define negative log-return (loss-oriented return):
+
+$$
+x_t = -\big(\log p_t - \log p_{t-1}\big).
+$$
+
+For quantile level $\tau$, estimate conditional quantile $\hat q_t^{(\tau)}$ from lag/Fourier regressors. The intraday downside exceedance is:
+
+$$
+E_t^{\downarrow} = \max\{0,\, x_t - \hat q_t^{(\tau)}\}.
+$$
+
+### 3) Intraday events to daily event features
+
+Script: src/features/create_raw_event_feat.py
+
+Inputs:
+1. data/interim/event_5_min/{COIN}_5m_events.parquet
+2. data/interim/daily_rv/{COIN}_rv.parquet
+
+Output:
+1. Updated data/interim/daily_rv/{COIN}_rv.parquet
+
+Added columns:
+1. perc_event_down: daily fraction of downside-event intervals, computed as $n_d^{\downarrow} / M$.
+2. exceedance_down: daily downside exceedance intensity, computed as $\log\left(\sum_j (E_{d,j}^{\downarrow})^2\right)$.
+
+Formally:
+
+$$
+\mathrm{perc\_event\_down}_d = \frac{1}{M}\sum_{j=1}^{M}\mathbf{1}\{E_{d,j}^{\downarrow}>0\},
+$$
+
+$$
+\mathrm{exceedance\_down}_d = \log\left(\sum_{j=1}^{M}\left(E_{d,j}^{\downarrow}\right)^2\right).
+$$
+
+### 4) Hawkes intensity to daily Hawkes feature
+
+Scripts:
+1. src/features/create_hawkes_feat.py
+2. src/features/tick_env_hawkes_fit.py
+
+Inputs:
+1. data/interim/event_5_min/{COIN}_5m_events.parquet
+2. data/interim/daily_rv/{COIN}_rv.parquet
+
+Intermediate output:
+1. data/interim/hawkes_daily/{COIN}_hawkes_daily.parquet
+
+Final output:
+1. Updated data/interim/daily_rv/{COIN}_rv.parquet with column lambda_hawkes
+
+Logic:
+1. Convert the intraday downside-event file into a minimal event-time table with indicator $\mathbf{1}\{E_t^{\downarrow} > 0\}$.
+2. For each day $d$, collect the extreme-event times from the previous 30 calendar days $[d-30, d)$.
+3. Fit a univariate exponential-kernel Hawkes process in the external tick environment using a fixed decay parameter $\beta$ and the selected objective (`likelihood` or `least-squares`).
+4. Evaluate the fitted intensity on the 5-minute grid over day $d$.
+5. Average those intraday intensities to obtain the daily Hawkes feature and merge it into the daily RV parquet as `lambda_hawkes`.
+
+External environment options for `tick`:
+1. Default behavior uses `conda run -n hawkes_env python`.
+2. Override env name with `hawkes_conda_env="..."` or `HAWKES_CONDA_ENV`.
+3. If needed, set `HAWKES_CONDA_EXE` to the full conda executable path.
+4. Explicitly bypass conda by passing `python_executable=".../python.exe"`.
+
+The fitted Hawkes intensity is
+
+$$
+\lambda_d(t) = \mu_d + \alpha_d \beta \sum_{t_i < t} e^{-\beta (t - t_i)}, \qquad t \in [d, d+1),
+$$
+
+where the event times $t_i$ are the downside extreme-event timestamps from the lookback window $[d-30, d)$.
+
+The daily Hawkes feature is the mean intensity over the 5-minute grid of day $d$:
+
+$$
+\lambda^{\mathrm{hawkes}}_d = \frac{1}{M} \sum_{j=1}^{M} \lambda_d(\tau_{d,j}),
+$$
+
+with $M=288$ and grid points $\tau_{d,j}$ spaced every 5 minutes.
+
+This value is stored in the daily dataset as
+
+$$
+\mathrm{lambda\_hawkes}_d = \lambda^{\mathrm{hawkes}}_d.
+$$
+
+### 5) Rolling-window forecast comparison
+
+Script: src/evaluation/eval_rolling_window.py
+
+Input:
+1. data/interim/daily_rv/{COIN}_rv.parquet
+
+Core setup:
+1. Train window = 1200 observations.
+2. Test window = 300 observations.
+3. Step = 300 observations.
+4. LSTM internal split on each train window: 900 train + 300 validation.
+5. HAR uses the full 1200-train window.
+
+Target definition (both models):
+
+$$
+y_t = RV_{t+1}.
+$$
+
+Fair-comparison protocol:
+1. HAR and LSTM are evaluated on the exact same rolling train/test date windows.
+2. Both models predict the same target $RV_{t+1}$.
+3. Both use the same daily information sources (RV and selected downside covariates), but with model-appropriate representation.
+4. Optional covariates can include `perc_event_down`, `exceedance_down`, and `lambda_hawkes`.
+
+Information representation by model:
+
+HAR regressors (aggregated view):
+
+$$
+X_t^{HAR} = \big(RV_{d,t},\ RV_{w,t},\ RV_{m,t},\ z_{d,t},\ z_{w,t},\ z_{m,t}\big),
+$$
+
+with
+
+$$
+RV_{d,t}=RV_t,\quad RV_{w,t}=\frac{1}{W}\sum_{i=0}^{W-1}RV_{t-i},\quad RV_{m,t}=\frac{1}{M_m}\sum_{i=0}^{M_m-1}RV_{t-i},
+$$
+
+and for each selected covariate $z_t$:
+
+$$
+z_{d,t}=z_t,\quad z_{w,t}=\frac{1}{W}\sum_{i=0}^{W-1}z_{t-i},\quad z_{m,t}=\frac{1}{M_m}\sum_{i=0}^{M_m-1}z_{t-i},
+$$
+
+where $W$ is the weekly window and $M_m$ is the monthly window.
+
+LSTM input (raw sequential view, lookback $L=30$):
+
+$$
+\mathbf{X}_t^{LSTM}=\left[(RV_{t-i},\ z_{1,t-i},\ldots,z_{m,t-i})\right]_{i=1}^{L},
+$$
+
+with tensor shape $(\text{batch},L,1+m)$.
+
+This setup enforces fairness in information origin while allowing each model to consume that information in its natural form (aggregated for HAR, sequential for LSTM).
+
+Behavior:
+1. The exact same rolling train/test windows are used for HAR and LSTM variants.
+2. Features are built on-the-fly from daily RV and aligned on common dates before window iteration.
+3. HAR uses aggregated covariate blocks per selected feature: $(z_d, z_w, z_m)$.
+4. LSTM test prediction uses only pre-test context rows (no test leakage).
+5. Verbose logs are printed for data load, model progress, and per-window save/skip status.
+6. Results are persisted under results/coin={COIN}.
+7. One predictions file and one summary file are created per model-features setup.
+8. Existing files are used as checkpoints, so completed windows are skipped on reruns.
+
+### 6) Notebook experiment runner
+
+Notebook: notebooks/run_rolling_window.ipynb
+
+The notebook executes experiments in a fixed, reproducible order:
+1. Baseline: default HAR and LSTM features.
+2. Baseline + perc_event_down.
+3. Baseline + exceedance_down.
+4. Baseline + perc_event_down + exceedance_down.
+
+It uses the RollingWindowEvaluator API from src/evaluation/eval_rolling_window.py and displays a combined summary table at the end.
+
+### 7) Model and statistical evaluation modules
+
+Modules:
+1. src/models/har.py: OLS HAR model implementation.
+2. src/models/LSTM.py: LSTM model for RV forecasting.
+3. src/evaluation/dm_test.py: Diebold-Mariano pairwise forecast comparison.
+4. src/evaluation/mcs_test.py: Model Confidence Set procedure.
+
+## Path Management
+
+All project paths are centralized in src/config/paths.py.
+
+Key constants include:
+1. ROOT_DIR
+2. DATA_DIR
+3. RAW_DATA_DIR (alias RAW_DATA)
+4. INTERIM_DATA_DIR (alias INTERIM_DATA)
+5. PROCESSED_DATA_DIR (alias PROCESSED_DATA)
+6. RESULTS_DIR
+
+This avoids fragile relative paths and keeps scripts robust regardless of current working directory.
