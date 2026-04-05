@@ -1,2 +1,0 @@
-coin,expected_obs_per_day,coverage_threshold,valid_start,valid_end,total_days_in_valid_interval,days_with_missing_data,pct_days_with_missing_data,days_completely_missed,pct_days_completely_missed
-ETH,288,0.9,2017-08-17 00:00:00+00:00,2025-12-31 00:00:00+00:00,3059,35,1.1441647597254005,0,0.0
